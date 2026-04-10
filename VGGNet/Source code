@@ -1,0 +1,166 @@
+import os, torch, torch.nn as nn, torch.optim as optim
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+import seaborn as sns
+from torch.utils.data import Dataset, DataLoader, random_split
+from torchvision import transforms
+from PIL import Image
+from sklearn.metrics import confusion_matrix, f1_score, classification_report
+from google.colab import drive
+
+# 1. Setup & Paths
+drive.mount('/content/drive')
+ROOT_PATH = '/content/drive/MyDrive/Distance_classification'
+REF_PATH = '/content/drive/MyDrive/Distance_classification/reference.jpg'
+CLASSES = ['10', '20', '30', '40', '50']
+
+# --- Helper Functions ---
+def get_roi_coords(image_path):
+    img = cv2.imread(image_path, 0)
+    if img is None: raise FileNotFoundError(f"Check path: {image_path}")
+    _, thresh = cv2.threshold(img, 20, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        c = max(contours, key=cv2.contourArea)
+        return cv2.boundingRect(c)
+    return (0, 0, img.shape[1], img.shape[0])
+
+def smoothen(data, weight=0.9):
+    """Calculates exponential moving average for a smooth curve."""
+    last = data[0]
+    smoothed = []
+    for point in data:
+        smoothed_val = last * weight + (1 - weight) * point
+        smoothed.append(smoothed_val)
+        last = smoothed_val
+    return smoothed
+
+# --- Dataset Class ---
+class DynamicSpeckleDataset(Dataset):
+    def __init__(self, root, ref_path):
+        self.samples = []
+        x, y, w, h = get_roi_coords(ref_path)
+        print(f"ROI Detected: x={x}, y={y}, w={w}, h={h}")
+        
+        # Process Reference ROI
+        ref_img = np.array(Image.open(ref_path).convert('L'))[y:y+h, x:x+w]
+        ref_t = transforms.ToTensor()(Image.fromarray(ref_img))
+        self.ref_norm = (ref_t - ref_t.mean()) / (ref_t.std() + 1e-8)
+        
+        for idx, cls in enumerate(CLASSES):
+            folder = os.path.join(root, cls)
+            if not os.path.exists(folder): continue
+            files = [f for f in os.listdir(folder) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+            print(f"Loading {cls}m: {len(files)} images")
+            for img_name in files:
+                img_path = os.path.join(folder, img_name)
+                img = np.array(Image.open(img_path).convert('L'))[y:y+h, x:x+w]
+                img_t = transforms.ToTensor()(Image.fromarray(img))
+                norm = (img_t - img_t.mean()) / (img_t.std() + 1e-8)
+                
+                # Combine Target and Reference as 2 channels
+                combined = torch.cat([norm, self.ref_norm], dim=0)
+                self.samples.append((transforms.Resize((224, 224))(combined), idx))
+        print(f"Total Dataset: {len(self.samples)} images.")
+
+    def __len__(self): return len(self.samples)
+    def __getitem__(self, i): return self.samples[i]
+
+# --- VGG-Lite Model ---
+class VGG_Speckle(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(2, 64, 3, padding=1), nn.ReLU(True), nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(True), nn.MaxPool2d(2),
+            nn.Conv2d(128, 256, 3, padding=1), nn.ReLU(True), nn.AdaptiveAvgPool2d((7, 7))
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(256 * 7 * 7, 512),
+            nn.ReLU(True),
+            nn.Dropout(0.5),
+            nn.Linear(512, 5)
+        )
+    def forward(self, x): return self.classifier(self.features(x))
+
+# --- Execution ---
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+dataset = DynamicSpeckleDataset(ROOT_PATH, REF_PATH)
+train_size = int(0.8 * len(dataset))
+train_set, test_set = random_split(dataset, [train_size, len(dataset) - train_size])
+
+train_loader = DataLoader(train_set, batch_size=4, shuffle=True)
+test_loader = DataLoader(test_set, batch_size=1)
+
+model = VGG_Speckle().to(device)
+optimizer = optim.Adam(model.parameters(), lr=0.0001)
+criterion = nn.CrossEntropyLoss()
+
+history = {'loss': [], 'train_acc': [], 'test_acc': []}
+
+print("\nStarting Training...")
+for epoch in range(100):
+    model.train()
+    running_loss, train_correct = 0.0, 0
+    for imgs, labels in train_loader:
+        imgs, labels = imgs.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(imgs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item()
+        train_correct += (torch.max(outputs, 1)[1] == labels).sum().item()
+    
+    model.eval()
+    test_correct = sum((torch.max(model(im.to(device)), 1)[1] == la.to(device)).item() for im, la in test_loader)
+    
+    history['loss'].append(running_loss/len(train_loader))
+    history['train_acc'].append(100*train_correct/len(train_set))
+    history['test_acc'].append(100*test_correct/len(test_set))
+    print(f"Epoch {epoch+1:02d} | Loss: {history['loss'][-1]:.4f} | Test Acc: {history['test_acc'][-1]:.1f}%")
+
+# --- FINAL RESULTS & SMOOTHED GRAPH ---
+print("\nGenerating Final Analytics...")
+y_true, y_pred = [], []
+model.eval()
+with torch.no_grad():
+    for im, la in test_loader:
+        y_true.append(la.item())
+        y_pred.append(torch.max(model(im.to(device)), 1)[1].item())
+
+# 1. Performance Report
+print(f"Weighted F1-Score: {f1_score(y_true, y_pred, average='weighted'):.4f}")
+print("\nClassification Report:\n", classification_report(y_true, y_pred, labels=np.arange(len(CLASSES)), target_names=CLASSES, zero_division=0))
+
+# 2. Plotting Only Smoothed Efficiency
+smooth_train = smoothen(history['train_acc'], weight=0.9)
+smooth_test = smoothen(history['test_acc'], weight=0.9)
+
+plt.figure(figsize=(10, 6))
+plt.plot(smooth_train, color='#1f77b4', linewidth=2.5, label='Training Efficiency')
+plt.plot(smooth_test, color='#ff7f0e', linewidth=2.5, label='Testing Efficiency')
+
+# Annotation for Final Values
+plt.text(len(smooth_train)-1, smooth_train[-1], f" {smooth_train[-1]:.1f}%", color='#1f77b4', fontweight='bold')
+plt.text(len(smooth_test)-1, smooth_test[-1], f" {smooth_test[-1]:.1f}%", color='#ff7f0e', fontweight='bold')
+
+plt.title('VGG-Lite System Efficiency Trend', fontsize=14, pad=15)
+plt.xlabel('Epoch', fontsize=12)
+plt.ylabel('Accuracy (%)', fontsize=12)
+plt.ylim(0, 105)
+plt.grid(True, linestyle='--', alpha=0.5)
+plt.legend(loc='lower right')
+plt.tight_layout()
+plt.show()
+
+# 3. Confusion Matrix
+plt.figure(figsize=(8, 6))
+cm = confusion_matrix(y_true, y_pred, labels=np.arange(len(CLASSES)))
+sns.heatmap(cm, annot=True, fmt='d', xticklabels=CLASSES, yticklabels=CLASSES, cmap='Purples')
+plt.title('VGG-Lite Confusion Matrix')
+plt.xlabel('Predicted')
+plt.ylabel('Actual')
+plt.show()
